@@ -1,33 +1,10 @@
 
-#include "gpib.h"
+#include "boards.h"
+#include "gpib_pin.h"
 #include <avr/io.h>
 #include <stdio.h>
 #include <util/delay.h>
 #include <avr/interrupt.h>
-
-
-#define ATN_LOW   DDRF |=  (1<<6)
-#define ATN_HIGH  DDRF &= ~(1<<6)
-#define NDAC_LOW  DDRC |=  (1<<7)
-#define NDAC_HIGH DDRC &= ~(1<<7)
-#define NRFD_LOW  DDRC |=  (1<<6)
-#define NRFD_HIGH DDRC &= ~(1<<6)
-#define DAV_LOW   DDRB |=  (1<<6)
-#define DAV_HIGH  DDRB &= ~(1<<6)
-#define EOI_LOW   DDRB |=  (1<<4)
-#define EOI_HIGH  DDRB &= ~(1<<4)
-#define REN_LOW   DDRB |=  (1<<5)
-#define REN_HIGH  DDRB &= ~(1<<5)
-#define IFC_LOW   DDRE |=  (1<<2)
-#define IFC_HIGH  DDRE &= ~(1<<2)
-
-
-
-#define DAV_STATE  (PINB & (1<<6))
-#define NDAC_STATE (PINC & (1<<7))
-#define NRFD_STATE (PINC & (1<<6))
-#define ATN_STATE  (PINF & (1<<6))
-#define EOI_STATE  (PINB & (1<<4))
 
 #define GPIB_DEVICE_CONNECTSTATE_UNKNOWN      (0)
 #define GPIB_DEVICE_CONNECTSTATE_DISCONNECTED (1)
@@ -54,16 +31,22 @@ static bool gpib_tx(uint8_t dat, bool iscommand, gpibtimeout_t ptimeoutfunc)
 {
 	bool timedout;
 	
-	DAV_HIGH;
-	NRFD_HIGH;
-	NDAC_HIGH;  /* they should be already high, but let's enforce it */
+	GPIB_ATN_OUT;
+	GPIB_DAV_OUT;
+	GPIB_NRFD_OUT;
+	GPIB_NDAC_OUT;
+	GPIB_NRFD_IN;
+	GPIB_DATA_OUT;
+	GPIB_DAV_HIGH;
+	GPIB_NRFD_HIGH;
+	GPIB_NDAC_HIGH;  /* they should be already high, but let's enforce it */
 	
 	if (iscommand)
-		ATN_LOW;
+		GPIB_ATN_LOW;
 	else
-		ATN_HIGH;
+		GPIB_ATN_HIGH;
 
-	DDRD = dat;   /* set Data to data bus */
+	GPIB_DATA_WRITE = dat;   /* set Data to data bus */
 	_delay_us(1); /* wait for data to settle */
 		
 	/* wait until ready for data acceptance (NRFD=H, NDAC=L)*/
@@ -71,21 +54,21 @@ static bool gpib_tx(uint8_t dat, bool iscommand, gpibtimeout_t ptimeoutfunc)
 	{
 		timedout = ptimeoutfunc();
 	}
-	while ( (NRFD_STATE == 0) && !timedout); /* wait until ready for data (NRFD to get high) */
+	while ( (GPIB_NRFD_STATE == 0) && !timedout); /* wait until ready for data (NRFD to get high) */
 
 	if (!timedout)
 	{
-		DAV_LOW;
+		GPIB_DAV_LOW;
 		do
 		{
 			timedout = ptimeoutfunc();
 		}
-		while ( (NDAC_STATE == 0) && !timedout ); /* wait until NDAC gets high*/
-		DAV_HIGH; 
+		while ( (GPIB_NDAC_STATE == 0) && !timedout ); /* wait until NDAC gets high*/
+		GPIB_DAV_HIGH; 
 	}
 	
-	DDRD = 0x00; /* release data bus */
-	ATN_HIGH;	 
+	GPIB_DATA_IN; /* release data bus */
+	GPIB_ATN_HIGH;	 
 	
 	if (timedout)
 	{
@@ -99,7 +82,7 @@ static bool gpib_dat(uint8_t dat, gpibtimeout_t ptimeoutfunc)
 	return gpib_tx(dat, false, ptimeoutfunc);
 }
 
-
+// Listener address
 static bool gpib_cmd_LAG(uint8_t addr, gpibtimeout_t ptimeoutfunc)
 {
 	bool result;
@@ -116,7 +99,7 @@ static bool gpib_cmd_SECADDR(uint8_t addr, gpibtimeout_t ptimeoutfunc)
 	return gpib_tx(addr | 0x60, true, ptimeoutfunc);
 }
 
-
+// Talk address
 static bool gpib_cmd_TAG(uint8_t addr, gpibtimeout_t ptimeoutfunc)
 {
 	bool result;
@@ -165,7 +148,6 @@ static bool gpib_cmd_GET(gpibtimeout_t ptimeoutfunc) // group execute trigger (a
 }
 
 
-
 uint8_t gpib_readStatusByte(uint8_t addr, gpibtimeout_t ptimeoutfunc)
 {
 	bool timedout, eoi;
@@ -177,9 +159,11 @@ uint8_t gpib_readStatusByte(uint8_t addr, gpibtimeout_t ptimeoutfunc)
 	if (!timedout)
 		timedout = gpib_cmd_SPE(ptimeoutfunc);
 	if (!timedout)
-		timedout = gpib_cmd_TAG(addr, ptimeoutfunc); 
-	ATN_HIGH; /* make ATN H */	
-	NDAC_LOW;   /* make NDAC L */
+		timedout = gpib_cmd_TAG(addr, ptimeoutfunc);
+	GPIB_ATN_OUT;
+	GPIB_NDAC_OUT;
+	GPIB_ATN_HIGH; /* make ATN H */	
+	GPIB_NDAC_LOW;   /* make NDAC L */
 
 	if (!timedout)
 		status = gpib_readdat(&eoi, &timedout, ptimeoutfunc);
@@ -260,6 +244,8 @@ static void timer_init(void)
 
 ISR (TIMER0_OVF_vect)
 {
+	// Save ATN direction
+	bool attdir = GPIB_ATN_DIR;
 	timer0_div++;
 	if (timer0_div >= 6) /* are 100ms passed? */
 	{
@@ -268,7 +254,8 @@ ISR (TIMER0_OVF_vect)
 		
 		if (!s_gpib_transaction_active) /* only check, if no GPIB transaction is active */
 		{
-			if (!ATN_STATE) /* is ATN LOW? This can only happen if no GPIB device is connected/powered */
+			GPIB_ATN_IN;
+			if (!GPIB_ATN_STATE) /* is ATN LOW? This can only happen if no GPIB device is connected/powered */
 			{
 				if (s_gpib_disconnect_counter == 2)
 				{ /* after 100-200ms with ATN low, assume, that there is no GPIB device connected */
@@ -286,6 +273,15 @@ ISR (TIMER0_OVF_vect)
 			}
 		}
 	}
+	// Restore ATN direction
+	if (attdir)
+	{
+		GPIB_ATN_OUT;
+	}
+	else
+	{
+		GPIB_ATN_IN;
+	}
 }
 
 
@@ -296,19 +292,25 @@ ISR (TIMER0_OVF_vect)
 
 void gpib_init(void)
 {
-// PB5 = REN
-	DDRD  = 0x00;
-	PORTD = 0x00;
-	PORTB &= ~((1<<4) | (1<<5) | (1<<6));
-	DDRB  &= ~((1<<4) | (1<<5) | (1<<6));
-	PORTC &= ~((1<<6) | (1<<7));
-	DDRC  &= ~((1<<6) | (1<<7));
-	PORTE &= ~(1<<2);
-	DDRE  &= ~(1<<2);
-	PORTF &= ~((1<<6) | (1<<7));
-	DDRF  &= ~((1<<6) | (1<<7));
-	
-	DDRB |= (1<<5); /* remote enable */
+
+	GPIB_DATA_IN;
+	GPIB_DATA_WRITE = 0x00;	// Disable PullUps
+
+	GPIB_ATN_IN;
+	GPIB_ATN_LOW; // Disable PullUp
+	GPIB_NDAC_IN;
+	GPIB_NDAC_LOW; // Disable PullUp
+	GPIB_NRFD_IN;
+	GPIB_NRFD_LOW; // Disable PullUp
+	GPIB_DAV_IN;
+	GPIB_DAV_LOW; // Disable PullUp
+	GPIB_EOI_IN;
+	GPIB_EOI_LOW; // Disable PullUp
+	// System Controller function - check how to handle?
+	GPIB_IFC_OUT;
+	GPIB_IFC_LOW; // Interface clear - off
+	GPIB_REN_OUT;
+	GPIB_REN_HIGH; // Remote enable
 
 	s_gpib_transaction_active = false;
 	s_gpib_disconnect_counter = 0;
@@ -326,27 +328,22 @@ void gpib_ren(bool enable)
 {
 	if (enable)
 	{
-		REN_LOW; /* remote enable */
+		GPIB_REN_LOW; /* remote enable */
 	}
 	else
 	{
-		REN_HIGH; /* remote disable */
+		GPIB_REN_HIGH; /* remote disable */
 	}
 }
 
-
-
-
 void gpib_interface_clear(void)
 {
-	IFC_LOW; /* interface clear */
+	GPIB_IFC_LOW; /* interface clear */
 	_delay_ms(100);
-	IFC_HIGH; /* interface clear */
+	GPIB_IFC_HIGH; /* interface clear */
 	_delay_ms(10);
 	s_gpib_transaction_active = false;
 }
-
-
 
 
 uint8_t gpib_readdat(bool *pEoi, bool *ptimedout, gpibtimeout_t ptimeoutfunc)
@@ -357,6 +354,11 @@ uint8_t gpib_readdat(bool *pEoi, bool *ptimedout, gpibtimeout_t ptimeoutfunc)
 	c = 0;
 	eoi = false;	
 	
+	GPIB_EOI_IN;
+	GPID_DAV_IN;
+	GPID_NDAC_OUT;
+	GPID_NRFD_OUT;
+
 	/* skipping NRFD LOW step, because we are able to handshake and response to data */
 	NDAC_LOW;
 	NRFD_HIGH;
@@ -365,22 +367,21 @@ uint8_t gpib_readdat(bool *pEoi, bool *ptimedout, gpibtimeout_t ptimeoutfunc)
 	{
 		timedout = ptimeoutfunc();
 	}
-	while ( (DAV_STATE != 0) && !timedout ); /* wait until DAV gets low */
+	while ( (GPIB_DAV_STATE != 0) && !timedout ); /* wait until DAV gets low */
 	
 	if (!timedout)
 	{
-		NRFD_LOW;
-		c = ~PIND;
-		eoi = (EOI_STATE == 0) ;
-		NDAC_HIGH;
+		GPIB_NRFD_LOW;
+		c = ~GPIB_DATA_READ;
+		eoi = (GPIB_EOI_STATE == 0) ;
+		GPIB_NDAC_HIGH;
 		
 		do
 		{
 			timedout = ptimeoutfunc();
 		}
-		while ( (DAV_STATE == 0) && !timedout ); /* wait until DAV gets high */
+		while ( (GPIB_DAV_STATE == 0) && !timedout ); /* wait until DAV gets high */
 	}
-
 	
 	if (s_terminator == '\0')
 		*pEoi = eoi;
@@ -417,8 +418,10 @@ bool  gpib_make_talker(uint8_t addr, gpibtimeout_t ptimeoutfunc)
 	timedout = gpib_cmd_UNL(ptimeoutfunc);
 	if (!timedout)
 		timedout = gpib_cmd_TAG(addr, ptimeoutfunc); /* address as talker*/
-	ATN_HIGH; /* make ATN H */	
-	NDAC_LOW;   /* make NDAC L */
+	GPIB_ATT_OUT;
+	GPIB_NDAC_OUT;
+	GPIB_ATN_HIGH; /* make ATN H */	
+	GPIB_NDAC_LOW;   /* make NDAC L */
 	
 	if (timedout)
 		gpib_recover();
@@ -435,7 +438,8 @@ bool gpib_make_listener(uint8_t addr, gpibtimeout_t ptimeoutfunc)
 	if (!timedout)
 		timedout = gpib_cmd_LAG(addr, ptimeoutfunc); /* address target as listener*/
 		
-	ATN_HIGH;    /* make ATN H */
+	GPIB_ATT_OUT;
+	GPIB_ATN_HIGH;    /* make ATN H */
 	
 	if (timedout)
 		gpib_recover();
@@ -446,12 +450,13 @@ bool gpib_make_listener(uint8_t addr, gpibtimeout_t ptimeoutfunc)
 bool gpib_writedat(uint8_t dat, bool Eoi, gpibtimeout_t ptimeoutfunc)
 {
 	bool timedout;
+	GPIB_EOI_OUT;
 	if (Eoi)
 	{
 		EOI_LOW; /* make EOI L */
 	}
 	timedout = gpib_dat(dat, ptimeoutfunc);
-	EOI_HIGH;    /* make EOI H */
+	GPIB_EOI_HIGH;    /* make EOI H */
 	return timedout;
 }
 
@@ -496,6 +501,7 @@ uint8_t gpib_search(void)
 	timeout_start(500);
 	gpib_tx(0x3F, true, is_timedout); // UNL
 	
+	GPIB_NDAC_IN;
 	foundaddr = 255;
 	addr = 255;
 	do
@@ -507,9 +513,11 @@ uint8_t gpib_search(void)
 			timeout_start(500);
 			gpib_cmd_LAG(addr, is_timedout);
 			
-			ATN_HIGH; /* make ATN H */
+			GPIB_ATN_OUT;
+			GPIB_ATN_HIGH; /* make ATN H */
 			_delay_ms(2);
-			if ( (NDAC_STATE == 0) && (ATN_STATE != 0))
+			GPIB_ATN_IN
+			if ( (GPIB_NDAC_STATE == 0) && (GPIB_ATN_STATE != 0))
 			{
 				foundaddr = addr;
 			}
@@ -526,9 +534,11 @@ uint8_t gpib_search(void)
 	{
 		/* address once without SA. If it responds, force it to this primary addressing only! */
 		gpib_cmd_LAG(addr & 0x1f, is_timedout);
+		GPIB_ATN_OUT;
 		ATN_HIGH; /* make ATN H */
 		_delay_ms(2);
-		if ( (NDAC_STATE == 0) && (ATN_STATE != 0))
+		GPIB_ATN_IN;
+		if ( (GPIB_NDAC_STATE == 0) && (GPIB_ATN_STATE != 0))
 		{
 			foundaddr = addr & 0x1f;
 		}
